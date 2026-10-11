@@ -1,0 +1,5 @@
+# Files run.sh fetches into cache/ on first use: <path under cache/> <TAB> <url> <TAB> <sha256>
+opt/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound/draft_basis.pt	https://github.com/Alssndr0/qwen38-flash-next-recipe/releases/download/v5.2-opt6/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound.draft_basis.pt	a2e8e08d12ad5029d760a0ced493c0393fe4b2bb25740c1ae23dbabcdb911a04
+opt/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound/gptq_int8_g128.pt	https://github.com/Alssndr0/qwen38-flash-next-recipe/releases/download/v5.2-opt6/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound.gptq_int8_g128.pt	f4f30284531da072f2962cec2f0324170ac2062e1af3dce1aadcf798af5fd929
+opt/Qwen3.8-Flash-Next-hibrid48/draft_basis.pt	https://github.com/Alssndr0/qwen38-flash-next-recipe/releases/download/v5.2-opt6/Qwen3.8-Flash-Next-hibrid48.draft_basis.pt	54a0ed95e3f75156d8395f3701c1eeb38ad56edc88ec0aa914fd67840712776a
+opt/Qwen3.8-Flash-Next-hibrid48/gptq_int8_g128.pt	https://github.com/Alssndr0/qwen38-flash-next-recipe/releases/download/v5.2-opt6/Qwen3.8-Flash-Next-hibrid48.gptq_int8_g128.pt	c53707b8155341598a3d95fba92b10dcbe31075b3340fa0f886a1d352b28d415

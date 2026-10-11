@@ -4,3 +4,8 @@ models/
 
 # local run logs
 *.log
+
+# script outputs
+results/
+vllm-src/
+kl_corpus.json

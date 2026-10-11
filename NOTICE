@@ -1,0 +1,14 @@
+This repository is based on myllmbox/qwen38-flash-next-recipe
+(https://github.com/myllmbox/qwen38-flash-next-recipe), by myllmbox and bilikas.
+
+Files from that repository: run.sh, stop.sh, view.sh, tune-host.sh, recipe.yaml, patches/ and
+docs/UPSTREAM-README.md (its README). They remain under their authors' terms; that repository does not state a
+license. run.sh and recipe.yaml carry changes made here, which are offered under Apache-2.0.
+
+Everything else in this repository (image/, scripts/, opt/, README.md) is licensed under the Apache License 2.0, see
+LICENSE. image/patches/ holds diffs against files in the myllmbox/qwen38-flash-next-vllm:v5.2 image, several of which
+come from vLLM (Apache-2.0); the three always-on fixes are backports of vLLM pull requests 58863, 58720 and 58784.
+
+The files run.sh downloads from this repository's releases (draft-head bases and GPTQ codes) are derived from the
+Qwen3.8-Flash-Next-hibrid48 and Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound checkpoints and are distributed under
+their Qwen licenses, which are attached to the same release.

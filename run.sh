@@ -2,6 +2,9 @@
 # Qwen3.8-Flash-Next (hibrid48: NVFP4 n-gram table demand-paged + NVFP4 output head, vLLM 0.29, fp8 KV) on ONE DGX Spark: download if needed, wait for
 # memory, evict stale page cache, serve, wait healthy.
 # Everything is configured in recipe.yaml. OpenAI API on :$PORT. ./stop.sh stops, ./view.sh stats.
+# This version also builds the optimized image from image/ when server.image is the tag in image/TAG, and fetches the
+# per-checkpoint files listed in opt/assets.tsv (see README.md). DRY_RUN=1 ./run.sh prints the docker command and
+# changes nothing: no download, no build, the running serve is left alone.
 set -euo pipefail
 cd "$(dirname "$0")"
 command -v docker >/dev/null || { echo "docker is required"; exit 1; }
@@ -37,6 +40,17 @@ mkdir -p "$MODELS_DIR" "$CACHE_DIR"
 MODELS_ABS="$(cd "$MODELS_DIR" && pwd)"; CACHE_ABS="$(cd "$CACHE_DIR" && pwd)"
 LOCAL_NAME="$(basename "$HF_REPO")"
 MODEL_DIR="$MODELS_ABS/$LOCAL_NAME"
+
+# --- the optimized image: built here from image/ (myllmbox's v5.2 + the changes in image/patches and image/files) when
+# server.image is this repo's tag and it is not on the box yet. A change under image/ comes with a new tag in image/TAG.
+if [ -f image/TAG ] && [ "$IMAGE" = "$(tr -d '[:space:]' < image/TAG)" ] && ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  if [ -n "${DRY_RUN:-}" ]; then
+    echo "· (dry run) would build $IMAGE from image/"
+  else
+    echo "· building $IMAGE from image/ (the first time this pulls the ~22G v5.2 base, then takes about a minute)"
+    docker build -t "$IMAGE" image/
+  fi
+fi
 
 # --- Hugging Face access ------------------------------------------------------------------------------
 # Anonymous downloads are rate-limited, and GATED repos (license-agreement models — the uncensored variants, most
@@ -93,7 +107,9 @@ hf_access() {  # hf_access <hf-repo>   — exports HF_TOKEN when one is found or
 # --- weights: ~98G, resumable (rerun on interruption) -------------------------------------------
 # "complete" = the index is there AND no partial blob is left behind by an interrupted download (huggingface_hub keeps
 # them under .cache/huggingface/download/*.incomplete and resumes them) — the index lands early, so it alone proves nothing.
-if [ ! -f "$MODEL_DIR/model.safetensors.index.json" ] || [ -n "$(find "$MODEL_DIR/.cache" -name '*.incomplete' -print -quit 2>/dev/null)" ]; then
+if [ -n "${DRY_RUN:-}" ] && [ ! -f "$MODEL_DIR/model.safetensors.index.json" ]; then
+  echo "· (dry run) $HF_REPO is not downloaded yet"
+elif [ ! -f "$MODEL_DIR/model.safetensors.index.json" ] || [ -n "$(find "$MODEL_DIR/.cache" -name '*.incomplete' -print -quit 2>/dev/null)" ]; then
   hf_access "$HF_REPO" || exit 1
   echo "· downloading $HF_REPO -> $MODEL_DIR"
   if command -v hf >/dev/null; then
@@ -109,14 +125,47 @@ if [ ! -f "$MODEL_DIR/model.safetensors.index.json" ] || [ -n "$(find "$MODEL_DI
 fi
 
 # --- assemble docker env + vllm flags straight from the recipe ----------------------------------
+# {model} in an env value = this checkpoint's folder name, so one recipe.yaml finds each checkpoint's own files under
+# cache/opt/<checkpoint>/. A missing file listed in opt/assets.tsv is downloaded from this repo's release and checked
+# against its sha256; a missing file that is not listed (a checkpoint without published files) switches its feature off
+# instead of failing: no basis = the full draft head (same outputs), no GPTQ codes = no INT8 (16-bit, same as stock).
+fetch_asset() {  # fetch_asset <path under cache/> -> 0 when the file is there or was fetched
+  local rel="$1" dst="$CACHE_ABS/$1" url="" sum=""
+  [ -s "$dst" ] && return 0
+  read -r url sum < <(awk -F'\t' -v r="$rel" '$1 == r { print $2, $3 }' opt/assets.tsv 2>/dev/null) || true
+  [ -n "$url" ] || return 1
+  if [ -n "${DRY_RUN:-}" ]; then echo "· (dry run) would download cache/$rel"; return 0; fi
+  echo "· downloading cache/$rel"
+  mkdir -p "$(dirname "$dst")"
+  curl -fL --retry 3 -C - -o "$dst.part" "$url" || { echo "✗ download failed: $url (rerun to resume)"; return 1; }
+  if ! echo "$sum  $dst.part" | sha256sum -c --quiet - >/dev/null 2>&1; then
+    rm -f "$dst.part"; echo "✗ cache/$rel: checksum mismatch, removed"; return 1
+  fi
+  mv "$dst.part" "$dst"
+}
+EK=(); EV=()
+while IFS=$'\t' read -r k v; do [ -n "$k" ] && { EK+=("$k"); EV+=("${v//\{model\}/$LOCAL_NAME}"); }; done < <(rsection env)
+NO_DH=""; NO_Q=""
+for i in "${!EK[@]}"; do
+  case "${EK[$i]}" in
+    OPT_DRAFT_HEAD_BASIS) [[ "${EV[$i]}" != /cache/* ]] || fetch_asset "${EV[$i]#/cache/}" || NO_DH=1;;
+    OPT_TARGET_QCODES)    [[ "${EV[$i]}" != /cache/* ]] || fetch_asset "${EV[$i]#/cache/}" || NO_Q=1;;
+  esac
+done
+[ -z "$NO_DH" ] || echo "  ⚠ no draft-head basis for $LOCAL_NAME: two-stage draft head off (outputs unchanged; README: fitting one)"
+[ -z "$NO_Q" ] || echo "  ⚠ no GPTQ codes for $LOCAL_NAME: INT8 target weights off, 16-bit as stock (README: making them)"
 ENVS=()
-while IFS=$'\t' read -r k v; do [ -n "$k" ] && ENVS+=(-e "$k=$v"); done < <(rsection env)
+for i in "${!EK[@]}"; do
+  [ -n "$NO_DH" ] && [[ "${EK[$i]}" == OPT_DRAFT_HEAD_* ]] && continue
+  [ -n "$NO_Q" ] && [[ "${EK[$i]}" == OPT_TARGET_* ]] && continue
+  ENVS+=(-e "${EK[$i]}=${EV[$i]}")
+done
 
 # INT4-AutoRound checkpoint (fp8 n-gram table in ple-table/, its own MTP draft head): table folder + its own table map, and the
 # draft folder the speculative-config points at (cache/draft-k10: links + small JSON, top-k 10, the head's shared-expert width)
 if [ -d "$MODEL_DIR/ple-table" ]; then
   ENVS+=(-e "MBX_PLE_FP8_DIR=/models/$LOCAL_NAME/ple-table" -e "MBX_PLE_NVME_DIR=/cache/ple-nvme-fp8")
-  python3 - "$MODEL_DIR" "/models/$LOCAL_NAME" "$CACHE_ABS/draft-k10" <<'PY' || { echo "✗ could not build the draft folder"; exit 1; }
+  [ -n "${DRY_RUN:-}" ] || python3 - "$MODEL_DIR" "/models/$LOCAL_NAME" "$CACHE_ABS/draft-k10" <<'PY' || { echo "✗ could not build the draft folder"; exit 1; }
 import json, os, shutil, struct, sys
 snap, csnap, out = sys.argv[1:4]
 wm = json.load(open(os.path.join(snap, "model.safetensors.index.json")))["weight_map"]
@@ -151,7 +200,7 @@ while IFS=$'\t' read -r k v; do
 done < <(rsection vllm)
 
 # INT4-AutoRound profile (measured on this checkpoint): fp8 side layers + draft scale 2, its draft head, no global MoE backend
-# (int4 experts take Marlin anyway; the draft head's bf16 experts refuse it), KV 24G (27G leaves too little headroom)
+# (int4 experts take Marlin anyway; the draft head's bf16 experts refuse it), KV at most 24G (27G leaves too little headroom)
 if [ -d "$MODEL_DIR/ple-table" ]; then
   ENVS+=(-e VLLM_FP8_HYBRID=1 -e MBX_MTP_DRAFT_SCALE=2)
   F2=(); i=0
@@ -160,7 +209,7 @@ if [ -d "$MODEL_DIR/ple-table" ]; then
     case "$f" in
       --moe-backend) i=$((i + 2)); continue;;
       --speculative-config) F2+=("$f" "${FLAGS[$((i + 1))]/\{\"method\":\"mtp\",/{\"method\":\"mtp\",\"model\":\"/cache/draft-k10\",}"); i=$((i + 2)); continue;;
-      --kv-cache-memory) v="${FLAGS[$((i + 1))]}"; [ "$v" = 27000000000 ] && v=24000000000; F2+=("$f" "$v"); i=$((i + 2)); continue;;
+      --kv-cache-memory) v="${FLAGS[$((i + 1))]}"; [ "$v" -gt 24000000000 ] 2>/dev/null && v=24000000000; F2+=("$f" "$v"); i=$((i + 2)); continue;;
     esac
     F2+=("$f"); i=$((i + 1))
   done
@@ -189,12 +238,14 @@ if [ "$cp_now" != 0 ]; then
   echo "  ⚠ vm.compaction_proactiveness is $cp_now (want 0): expect ~10 % lower throughput and periodic 4-5 s stalls"
   echo "    under load. One-time fix, needs sudo, shows what it runs first:  ./tune-host.sh"
 fi
-docker rm -f "$NAME" "$NAME-proxy" >/dev/null 2>&1 || true
+[ -n "${DRY_RUN:-}" ] || docker rm -f "$NAME" "$NAME-proxy" >/dev/null 2>&1 || true
 
 # optional vLLM patches (recipe.yaml server.patches → patches/<name>.patch; default none): the files a patch touches are
 # copied out of the image, patched and mounted read-only over the image's own copies. The image itself is never changed.
 PATCHES="$(rkey server patches)"; PMOUNTS=()
-if [ -n "$PATCHES" ]; then
+if [ -n "$PATCHES" ] && [ -n "${DRY_RUN:-}" ]; then
+  echo "· (dry run) would apply patches: $PATCHES (their mounts are not shown below)"
+elif [ -n "$PATCHES" ]; then
   command -v patch >/dev/null || { echo "✗ server.patches needs the 'patch' tool on this box (apt install patch)"; exit 1; }
   VLLM_DIR="$(docker run --rm --entrypoint python3 "$IMAGE" -c 'import importlib.util as u; print(u.find_spec("vllm").submodule_search_locations[0])')"
   STAGE="$CACHE_ABS/patched"; rm -rf "$STAGE"; mkdir -p "$STAGE"
@@ -218,7 +269,7 @@ fi
 
 # memory gate (unified memory: a serve relaunched seconds after a teardown gets a PHANTOM "CUDA out of memory" — the
 # previous container's GPU pages take 30-60 s to come back). The load needs ~100G available; the table then fills the rest.
-t=0; while :; do
+t=0; while [ -z "${DRY_RUN:-}" ]; do
   avail=$(free -g | awk '/^Mem:/{print $7}')
   [ "${avail:-0}" -ge 100 ] && { echo "  ✓ memory: ${avail}G available"; break; }
   [ "$t" -ge 120 ] && { echo "  ✗ only ${avail}G available after 120 s (need ~100G) — another container on the box? (docker ps)"; exit 1; }
@@ -227,28 +278,35 @@ t=0; while :; do
 done
 # evict our own checkpoint files from the page cache (no root: POSIX_FADV_DONTNEED via dd) — the GPU driver wants pages
 # that are FREE, and a 60-70G stale shard cache during the load has stalled it
-find "$MODEL_DIR" -type f -name "*.safetensors" -exec dd if={} iflag=nocache count=0 status=none \; 2>/dev/null || true
-echo "  · page cache: checkpoint files evicted — MemFree $(awk '/^MemFree/{printf "%d", $2/1048576}' /proc/meminfo)G"
+[ -n "${DRY_RUN:-}" ] || find "$MODEL_DIR" -type f -name "*.safetensors" -exec dd if={} iflag=nocache count=0 status=none \; 2>/dev/null || true
+[ -n "${DRY_RUN:-}" ] || echo "  · page cache: checkpoint files evicted — MemFree $(awk '/^MemFree/{printf "%d", $2/1048576}' /proc/meminfo)G"
 # dynamic draft depth (recipe.yaml mtp_depth; absent or mode: off = fixed K) → cache/mbx-depth.json, read live by the serve
 lst() { printf '%s' "$1" | tr -d '[] '; }
 MD_MODE="$(rkey mtp_depth mode)"; MD_MIN="$(rkey mtp_depth min)"; MD_WIN="$(rkey mtp_depth window)"
 MD_UP="$(lst "$(rkey mtp_depth promote)")"; MD_DN="$(lst "$(rkey mtp_depth demote)")"; MD_LOG="$(rkey mtp_depth log)"
-printf '{"mode": "%s", "min": %s, "window": %s, "promote": [%s], "demote": [%s], "log": %s}\n' \
-  "${MD_MODE:-off}" "${MD_MIN:-3}" "${MD_WIN:-48}" "${MD_UP:-60,45}" "${MD_DN:-25,15}" "${MD_LOG:-false}" > "$CACHE_ABS/mbx-depth.json"
+DEPTH_JSON="$(printf '{"mode": "%s", "min": %s, "window": %s, "promote": [%s], "demote": [%s], "log": %s}' \
+  "${MD_MODE:-off}" "${MD_MIN:-3}" "${MD_WIN:-48}" "${MD_UP:-60,45}" "${MD_DN:-25,15}" "${MD_LOG:-false}")"
+if [ -n "${DRY_RUN:-}" ]; then echo "· (dry run) cache/mbx-depth.json would be: $DEPTH_JSON"; else echo "$DEPTH_JSON" > "$CACHE_ABS/mbx-depth.json"; fi
 [ "${MD_MODE:-off}" = dynamic ] && echo "  · draft depth: dynamic (min ${MD_MIN:-3}, window ${MD_WIN:-48}, promote ${MD_UP:-60,45}, demote ${MD_DN:-25,15}) — edit cache/mbx-depth.json to change it live"
+RUNARGS=(--name "$NAME" --gpus all --ipc=host
+  ${CPUSET:+--cpuset-cpus "$CPUSET"}
+  ${DOCKER_ARGS}
+  "${PUBLISH[@]}"
+  -v "$MODELS_ABS:/models" -v "$CACHE_ABS:/cache"
+  -v "$(readlink -f "$MODEL_DIR"):/models/$LOCAL_NAME"
+  "${PMOUNTS[@]}"
+  -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1
+  -e FLASHINFER_WORKSPACE_BASE=/cache/flashinfer-workspace
+  -e VLLM_CACHE_ROOT=/cache/vllm-cache
+  "${ENVS[@]}"
+  --entrypoint vllm "$IMAGE" serve "/models/$LOCAL_NAME" --port 8000 "${FLAGS[@]}")
+if [ -n "${DRY_RUN:-}" ]; then
+  echo "· (dry run) the serve would start with:"
+  printf 'docker run -d'; printf ' %q' "${RUNARGS[@]}"; echo
+  exit 0
+fi
 echo "· starting $NAME  ($IMAGE)  on :$PORT — healthy in ~4 min; the very first boot on a box also prepares the table map (a few minutes, once)"
-docker run -d --name "$NAME" --gpus all --ipc=host \
-  ${CPUSET:+--cpuset-cpus "$CPUSET"} \
-  ${DOCKER_ARGS} \
-  "${PUBLISH[@]}" \
-  -v "$MODELS_ABS:/models" -v "$CACHE_ABS:/cache" \
-  -v "$(readlink -f "$MODEL_DIR"):/models/$LOCAL_NAME" \
-  "${PMOUNTS[@]}" \
-  -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
-  -e FLASHINFER_WORKSPACE_BASE=/cache/flashinfer-workspace \
-  -e VLLM_CACHE_ROOT=/cache/vllm-cache \
-  "${ENVS[@]}" \
-  --entrypoint vllm "$IMAGE" serve "/models/$LOCAL_NAME" --port 8000 "${FLAGS[@]}" >/dev/null
+docker run -d "${RUNARGS[@]}" >/dev/null
 if [ -n "$PROXY" ]; then
   docker run -d --name "$NAME-proxy" --network host -v "$CACHE_ABS:/cache" "${PENV[@]}" \
     --entrypoint python3 "$IMAGE" -c "import mbx_proxy; mbx_proxy.main()" >/dev/null
