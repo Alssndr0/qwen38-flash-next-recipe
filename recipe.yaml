@@ -2,17 +2,20 @@
 # Flag mapping: `name: value` -> --name value | `name: true` -> --name | `name: false` -> omitted.
 
 server:
-  image: myllmbox/qwen38-flash-next-vllm:v5.2   # pinned public tag (digest in README) = vLLM 0.30.0 (vllm/vllm-openai) + patches:
+  image: myllmbox/qwen38-flash-next-vllm:v5.2-opt5   # LOCAL build (2026-10-08): v5.2 + the decode optimizations in
+                                                # ~/projects/qwen38-spark-opt (Dockerfile in ~/projects/qwen38-spark-opt/image). Back to stock:
+                                                # myllmbox/qwen38-flash-next-vllm:v5.2
+  # image: myllmbox/qwen38-flash-next-vllm:v5.2   # pinned public tag (digest in README) = vLLM 0.30.0 (vllm/vllm-openai) + patches:
                                                 # the n-gram tables (fp8 and NVFP4), the INT4-AutoRound fp8 side layers, the 4-bit
                                                 # output head (hibrid48), the fused multi-step MTP draft, RecoverSSM.
                                                 # v5.1 (hibrid48 default) = `git checkout v5.1`.
   docker_args: --security-opt seccomp=unconfined   # required by the image's table reader
   cpuset: "5-9,15-19"                           # the GB10's 10 Cortex-X925 3.9GHz cores (0-4,10-14
                                                 # are 2.8GHz A725) — measured +2-3% at every concurrency
-  model: azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound   # HF repo — downloaded into ./models on first run (~120G)
+  # model: azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound   # HF repo — downloaded into ./models on first run (~120G)
                                                 # 5 of 512 experts per token, AutoRound int4 — the fastest. run.sh applies its
                                                 # settings itself (fp8 table, its draft head, KV 24G)
-  # model: myllmbox/Qwen3.8-Flash-Next-hibrid48   # the full 10-expert body (NVFP4, 98G): ~20 % slower, more creative answers
+  model: myllmbox/Qwen3.8-Flash-Next-hibrid48   # the full 10-expert body (NVFP4, 98G): ~20 % slower, more creative answers
   # model: myllmbox/Qwen3.8-Flash-Next-hibrid48-uncensored   # the abliterated body (OrcaRouter) with the same head, 98G:
                                                 # no refusals, NO guardrails — research / red-teaming / private use behind your
                                                 # own moderation. GATED on Hugging Face: accept its agreement, then hf auth login
@@ -38,6 +41,19 @@ env:
   FLASHINFER_CUDA_ARCH_LIST: "12.1a"
   MALLOC_MMAP_THRESHOLD_: "65536"               # glibc returns big freed blocks to the OS at once (the loader's
   MALLOC_TRIM_THRESHOLD_: "131072"              # garbage otherwise stays resident — and swaps)
+  # --- v5.2-opt (2026-10-08, see ~/projects/qwen38-spark-opt/README.md) ---
+  MBX_SKINNY_GEMM_SM12X: "1"                    # GB10 plan table for the small bf16 decode GEMMs (cuBLAS picks SM80 WMMA)
+  OPT_PLE_ASYNC: "1"                            # n-gram table reads off the main thread: no CPU<->GPU sync per forward
+  OPT_MTP_FP8: "1"                              # FP8 drafter projections — output-exact (rejection sampling)
+  OPT_DRAFT_HEAD_BASIS: "/cache/draft_basis_r256_multi.pt"   # two-stage draft head (output-exact): +11 % at 1 stream,
+                                                # +3 % at 16 (greedy, fixed depth); ~0.4 GB; remove the line to disable
+  OPT_DRAFT_HEAD_SCORER: "fp4"                  # NVFP4 shortlist scorer (v5.2-opt3): same coverage, -0.13 ms per draft pass
+  OPT_TARGET_FP8: "1"                           # target projections in 8 bits (+10 % at 1 stream, +3 % at 16)
+                                                # model's outputs (KL 0.027 nats/token above the run-to-run floor)
+  OPT_TARGET_QFMT: "int8"                       # INT8 per 128-group (Marlin W8A16) instead of FP8 e4m3
+  OPT_TARGET_QGROUP: "128"
+  OPT_TARGET_QCODES: "/cache/gptq2_int8_g128.pt"  # offline GPTQ codes (scripts/gptq_int8.py): KL 0.024 vs
+                                                # 0.043 for FP8 (floor 0.016), NLL unchanged
 
 vllm:
   served-model-name: Qwen/Qwen3.8-Flash-Next
@@ -46,7 +62,7 @@ vllm:
   moe-backend: marlin                           # fastest MoE kernel for NVFP4 W4A16 on the GB10 (hibrid48; run.sh drops it for INT4-AutoRound)
   distributed-executor-backend: mp
   gpu-memory-utilization: 0.70                  # with kv-cache-memory pinned this does not size the KV pool
-  kv-cache-memory: "27000000000"                # hibrid48: 27G bf16 = 876,726 KV tokens. INT4-AutoRound: run.sh uses 24G = 777,693. Leaves ~1G available
+  kv-cache-memory: "26000000000"                # hibrid48: 27G bf16 = 876,726 KV tokens. INT4-AutoRound: run.sh uses 24G = 777,693. Leaves ~1G available
                                                 # at 16 streams; 26G if you run other things on the box
   load-format: fastsafetensors                  # weights in ~80 s; remove for vLLM's default loader (~10 min)
   max-model-len: 262144                         # the model's native max
@@ -79,8 +95,10 @@ vllm:
 # and swap in the two commented K=5 lines above. run.sh writes cache/mbx-depth.json;
 # the serve re-reads that file while it runs, so the numbers below can be changed live.
 mtp_depth:
-  mode: dynamic                                 # dynamic (default) | off = fixed K: swap in the K=5 lines above
-  min: 3                                        # lowest draft depth
+  mode: opt                                     # opt (v5.2-opt): throughput-optimal batch depth from measured
+                                                # acceptance and step cost (shipped per-request logic at 1 stream)
+                                                # | dynamic (shipped default) | off = fixed K: swap in the K=5 lines above
+  min: 3                                        # lowest draft depth (also the start depth of the 1-stream logic)
   window: 48                                    # steps of history each decision looks at (8–128)
   promote: [60, 45]                             # +2 / +1 depth when the deepest position was accepted on more than this % of steps
   demote: [25, 15]                              # −1 / −2 depth when below this %
