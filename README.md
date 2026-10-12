@@ -28,7 +28,7 @@ cd qwen38-flash-next-recipe
 
 The first run:
 
-1. builds the image `qwen38-flash-next-vllm:v5.2-opt6` from [image/](image/): it pulls myllmbox's
+1. builds the image `qwen38-flash-next-vllm:v5.2-opt7` from [image/](image/): it pulls myllmbox's
    `myllmbox/qwen38-flash-next-vllm:v5.2` (about 22 GB) and adds this repo's changes, which takes about a minute;
 2. downloads the model from Hugging Face (about 98 GB for hibrid48);
 3. downloads the two files this checkpoint's speedups need (about 1.5 GB, from this repo's
@@ -57,6 +57,7 @@ image ([image/patches/](image/patches/)) and three new files ([image/files/](ima
 | `OPT_MTP_FP8: "1"` | The drafter's 11 projections in FP8 (e4m3 per channel, Marlin W8A16): about 80 MB less read per draft pass. Exact through rejection sampling. |
 | `mtp_depth: mode: opt` | Batch draft depth = argmax of expected accepted tokens over measured step time; at 1 stream it keeps the shipped per-request logic. Also always on: the depth bookkeeping no longer syncs GPU tensors to the host. |
 | `OPT_DRAFT_HEAD_BASIS`, `OPT_DRAFT_HEAD_SCORER: "fp4"` | Two-stage draft vocabulary head: a rank-256 projection shortlists 2,048 candidates and only those are scored with the real head (draft pass 1554 to 487 us at 1 stream). Exact: only the draft proposals can change, and verification against the target is unchanged. Needs a basis fitted per checkpoint (downloaded). |
+| `OPT_DRAFT_TOPK: "20"`, `OPT_DRAFT_TOPP: "0.95"` | Draft truncation (v5.2-opt7, needs the two-stage draft head). vLLM samples drafts with temperature only, but verifies them against the target after the request's top_k / top_p (this checkpoint's defaults: 20 / 0.95), so draft probability outside that set can never be accepted. The draft is cut to its own top 20, then top-p 0.95, in one Triton kernel that is cheaper than the scatter it replaces (draft pass 412 vs 450 us at 1 stream). Exact: the verifier uses the same truncated distribution the draft was sampled from. Measured on hibrid48 on replayed OpenCode and Pi coding-agent traffic at 1 stream (177 requests, 25 sessions, paired): +2.0 % decode tok/s (95 % CI +0.4 to +3.7 %), +2.9 % tokens per draft step; a sampled-output distribution test found no difference. Not measured on INT4-AutoRound, where it is exact but its speed effect is unknown. |
 
 **Changes outputs slightly** (on by default here, remove the four `OPT_TARGET_*` lines for 16-bit):
 
@@ -84,7 +85,7 @@ distributions against the stock serve (`scripts/klprobe.py`, about 10,000 positi
 own run-to-run floor, plus a 400-problem exact-answer eval (`scripts/taskeval.py`).
 
 **hibrid48** (measured on earlier builds of this code, `v5.2-opt3` to `v5.2-opt5`; `v5.2-opt6` adds only the INT4
-draft-head path and the state-dump hook):
+draft-head path and the state-dump hook; `v5.2-opt7` adds draft truncation, measured in its own row above):
 
 - Output-exact set vs stock v5.2: +9 to +24 % at 1 stream, +1 to +14 % at 4 streams, +2 to +11 % at 16 streams.
   Prefill unchanged.
@@ -139,14 +140,14 @@ draft-head path and the state-dump hook):
 **GPTQ codes** (`gptq_int8_g128.pt`):
 
 1. Copy the vLLM source out of the image for the code part of the calibration text:
-   `cid=$(docker create qwen38-flash-next-vllm:v5.2-opt6); docker cp $cid:/usr/local/lib/python3.12/dist-packages/vllm vllm-src; docker rm $cid`
+   `cid=$(docker create qwen38-flash-next-vllm:v5.2-opt7); docker cp $cid:/usr/local/lib/python3.12/dist-packages/vllm vllm-src; docker rm $cid`
 2. Boot a calibration serve: remove the four `OPT_TARGET_*` lines, add `OPT_CALIB_DIR: "/cache/calib"`,
    `OPT_CALIB_ROWS: "12288"` and `OPT_CALIB_PER_CALL: "300"`, and use a smaller KV pool
    (`kv-cache-memory: "16000000000"`).
 3. `CALIB_MORE=1 CALIB_OUT=cache/calib CALIB_SRC=vllm-src python3 scripts/calib_capture.py`. It generates text, then
    arms the recorders and prefills it: about 34 GB of recorded rows for hibrid48.
 4. `./stop.sh`, then run GPTQ inside the image (about 3 minutes):
-   `docker run --rm --gpus all -v $PWD/cache:/cache -v $PWD/scripts:/scripts --entrypoint python3 qwen38-flash-next-vllm:v5.2-opt6 /scripts/gptq_int8.py /cache/calib /cache/opt/<checkpoint>/gptq_int8_g128.pt`
+   `docker run --rm --gpus all -v $PWD/cache:/cache -v $PWD/scripts:/scripts --entrypoint python3 qwen38-flash-next-vllm:v5.2-opt7 /scripts/gptq_int8.py /cache/calib /cache/opt/<checkpoint>/gptq_int8_g128.pt`
 5. Restore `recipe.yaml`; `cache/calib` can be deleted.
 
 ## Checking a change

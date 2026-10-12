@@ -2,7 +2,7 @@
 # Flag mapping: `name: value` -> --name value | `name: true` -> --name | `name: false` -> omitted.
 
 server:
-  image: qwen38-flash-next-vllm:v5.2-opt6        # built by run.sh from image/ on the first run: myllmbox's v5.2 below plus
+  image: qwen38-flash-next-vllm:v5.2-opt7        # built by run.sh from image/ on the first run: myllmbox's v5.2 below plus
                                                 # this repo's decode changes (README.md). For the stock image use the line
                                                 # below; the OPT_* lines in env: then do nothing.
   # image: myllmbox/qwen38-flash-next-vllm:v5.2   # pinned public tag (digest in README) = vLLM 0.30.0 (vllm/vllm-openai) + patches:
@@ -49,6 +49,8 @@ env:
   OPT_DRAFT_HEAD_BASIS: "/cache/opt/{model}/draft_basis.pt"   # two-stage draft head, output-exact: +11 % at 1 stream,
                                                 # +3 % at 16 (greedy, fixed depth); about 0.4 GB
   OPT_DRAFT_HEAD_SCORER: "fp4"                  # NVFP4 shortlist scorer: same coverage, -0.13 ms per draft pass
+  OPT_DRAFT_TOPK: "20"                          # draft truncation to the target's own default support (top_k 20, top_p 0.95),
+  OPT_DRAFT_TOPP: "0.95"                        # output-exact: +2.0 % decode on coding-agent traffic (hibrid48, README)
   # INT8 target weights with GPTQ codes: +10 % at 1 stream, +3 % at 16. Changes outputs slightly (hibrid48: KL 0.024
   # against a run-to-run floor of 0.016; FP8 would be 0.043), task accuracy unchanged. Remove these four for 16-bit.
   OPT_TARGET_FP8: "1"

@@ -12,6 +12,15 @@ drafted (acceptance only).
 Enable: OPT_DRAFT_HEAD_BASIS=/path/basis.pt (a dict {"P": [H, r] float tensor}); OPT_DRAFT_HEAD_K (default 2048).
 OPT_DRAFT_HEAD_SCORER=fp4 stores U as NVFP4 (Marlin W4A16, 32 MB at r = 256) instead of FP8: same held-out coverage
 (99.634 % multilingual, scripts/draft_head_fp4.py), scorer 284 -> 154 us, draft pass 482 -> 377 us at M = 1.
+
+Draft truncation (OPT_DRAFT_TOPK / OPT_DRAFT_TOPP; the attributes topk / topp can also be changed while serving): keep
+only the draft's own top-k and then top-p (at the scaled logits, i.e. temperature 1) of the candidates. vLLM samples
+drafts with temperature only, while the target is verified after top_k / top_p (generation_config defaults: 20 / 0.95),
+so draft mass outside the target's support can never be accepted. Truncating q towards the target's support raises
+acceptance; the output stays exact because the verifier uses the same truncated q the draft was sampled from.
+
+A basis file may also hold a fitted pair {"P", "Q"}: the state is projected with P and the vocabulary scored with
+U = W Q (scripts in ~/projects/qwen38-spark-opt/agentic fit both on captured drafter states).
 """
 import json
 import os
@@ -83,6 +92,52 @@ def _cand_logits_int4_kernel(h_ptr, cand_ptr, pk_ptr, s_ptr, out_ptr, zero, K, s
     tl.store(out_ptr + m * stride_o + offs_c, acc, mask=mask_c)
 
 
+@triton.jit
+def _trunc_scatter_kernel(cl_ptr, cand_ptr, out_ptr, K, stride_cl, stride_c, stride_o, topp,
+                          TOPK: tl.constexpr, BLOCK: tl.constexpr):
+    """Draft truncation for one row in one program: of the K candidate logits, keep the TOPK largest, then the smallest
+    prefix (largest first) whose softmax mass over those TOPK reaches topp; write only the kept logits into the
+    -inf-filled vocabulary row at their candidate ids. Same result as truncate() (ties: lowest candidate index first)."""
+    m = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    x = tl.load(cl_ptr + m * stride_cl + offs, mask=offs < K, other=float("-inf"))
+    # pass 1: the top-k values in descending order -> their softmax normalizer
+    vmax = tl.max(x, axis=0)
+    work = x
+    z = 0.0
+    for _ in range(TOPK):
+        v = tl.max(work, axis=0)
+        i = tl.argmax(work, axis=0)
+        z += tl.exp(v - vmax)
+        work = tl.where(offs == i, float("-inf"), work)
+    # pass 2: walk the same order again; keep while the mass before the token is below topp
+    work = x
+    run = 0.0
+    for _ in range(TOPK):
+        v = tl.max(work, axis=0)
+        i = tl.argmax(work, axis=0)
+        p = tl.exp(v - vmax) / z
+        if (run < topp) | (topp >= 1.0):
+            row = tl.load(cand_ptr + m * stride_c + i).to(tl.int64)
+            tl.store(out_ptr + m * stride_o + row, v.to(out_ptr.dtype.element_ty))
+        run += p
+        work = tl.where(offs == i, float("-inf"), work)
+
+
+def truncate(ids: torch.Tensor, lg: torch.Tensor, topk: int, topp: float):
+    """Keep each row's top-k logits, then the smallest prefix whose softmax mass (temperature 1) reaches topp, the
+    same order of operations as the target's sampler. ids/lg [n, m] -> [n, k'] (masked entries get -inf)."""
+    kk = min(topk, lg.shape[1]) if topk > 0 else min(lg.shape[1], 256)
+    v, j = lg.topk(kk, dim=-1)                                                                    # sorted descending
+    if topp < 1.0:
+        # top-p over the top-k (renormalized), as the target's sampler; without top-k, over all candidates
+        lse = torch.logsumexp((v if topk > 0 else lg).float(), dim=-1, keepdim=True)
+        pr = torch.exp(v.float() - lse)
+        keep = (pr.cumsum(-1) - pr) < topp                                                         # top-1 always kept
+        v = v.masked_fill(~keep, float("-inf"))
+    return ids.gather(1, j), v
+
+
 class DraftHead:
     def __init__(self, model_dir: str, basis_path: str, device, k: int):
         from safetensors import safe_open
@@ -120,14 +175,29 @@ class DraftHead:
             self.g = float(f.get_tensor("lm_head.weight_scale_2").float())
             self.V, self.H = self.pk.shape[0], self.pk.shape[1] * 2
             self.lut = torch.tensor(_LUT, dtype=torch.float32, device=device)
-        P = torch.load(basis_path)["P"].float().to(device)                                          # [H, r]
+        self.device = device
+        self.fp4 = os.environ.get("OPT_DRAFT_HEAD_SCORER", "fp8") == "fp4"
+        self.k = k
+        self.buf = None
+        self.topk = int(os.environ.get("OPT_DRAFT_TOPK", "0"))
+        self.topp = float(os.environ.get("OPT_DRAFT_TOPP", "1.0"))
+        self.set_basis(basis_path)
+
+    def set_basis(self, basis_path: str) -> None:
+        """(Re)build the scorer from a basis file {"P": [H, r]} (U = W P) or {"P", "Q"} (a fitted pair: z = h P,
+        U = W Q); callable while serving (eager path)."""
+        device = self.device
+        obj = torch.load(basis_path, map_location="cpu")
+        P = obj["P"].float().to(device)                                                             # [H, r]
+        Q = obj["Q"].float().to(device) if "Q" in obj else P
         self.P = P.to(torch.bfloat16)
         r = P.shape[1]
         # scorer U = W P [V, r] as a Marlin weight: FP8 per-row (W8A16) or NVFP4 (W4A16); one GEMV reads it per pass
-        self.fp4 = os.environ.get("OPT_DRAFT_HEAD_SCORER", "fp8") == "fp4"
+        self.scorer = None
+        torch.cuda.empty_cache()
         U = torch.empty(self.V, r, dtype=torch.float32, device=device)
         for a in range(0, self.V, 16384):
-            U[a:a + 16384] = self.dequant(a, min(a + 16384, self.V)) @ P
+            U[a:a + 16384] = self.dequant(a, min(a + 16384, self.V)) @ Q
         holder = torch.nn.Module()
         holder.output_size_per_partition, holder.input_size_per_partition = self.V, r
         if self.fp4:
@@ -150,11 +220,12 @@ class DraftHead:
         del U
         self.scorer = holder
         self.r = r
-        self.k = k
-        self.buf = None
-        log.info("opt draft head: %s head, rank %d, %d candidates, %s scorer %.0f MB + raw head %.0f MB", self.fmt,
-                 r, k, "nvfp4" if self.fp4 else "fp8", self.V * r / (2e6 if self.fp4 else 1e6),
-                 (self.pk.numel() + (self.s4.numel() * 2 if self.fmt == "int4" else self.sc.numel())) / 1e6)
+        self.basis_path = basis_path
+        log.info("opt draft head: %s head, basis %s, rank %d, %d candidates, %s scorer %.0f MB + raw head %.0f MB, "
+                 "draft top-k %d top-p %.3f", self.fmt, basis_path, r, self.k, "nvfp4" if self.fp4 else "fp8",
+                 self.V * r / (2e6 if self.fp4 else 1e6),
+                 (self.pk.numel() + (self.s4.numel() * 2 if self.fmt == "int4" else self.sc.numel())) / 1e6,
+                 self.topk, self.topp)
 
     def dequant(self, a: int, b: int) -> torch.Tensor:
         """Rows a..b of the vocabulary head as float32 [b - a, H]."""
@@ -195,5 +266,11 @@ class DraftHead:
             self.buf = torch.empty(max(n, 128), self.V, dtype=torch.bfloat16, device=h.device)
         out = self.buf[:n]
         out.fill_(float("-inf"))
+        if 0 < self.topk <= 64 and self.k <= 4096 and os.environ.get("OPT_DRAFT_TRUNC_TORCH", "0") != "1":
+            _trunc_scatter_kernel[(n,)](cl, cand, out, self.k, cl.stride(0), cand.stride(0), out.stride(0),
+                                        float(self.topp), TOPK=self.topk, BLOCK=triton.next_power_of_2(self.k))
+            return out
+        if self.topk > 0 or self.topp < 1.0:
+            cand, cl = truncate(cand, cl, self.topk, self.topp)
         out.scatter_(1, cand.long(), cl.to(out.dtype))
         return out
