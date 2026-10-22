@@ -1,0 +1,130 @@
+# [dflash2 kit] myllmbox v5.3 recipe.yaml with the DFlash2 drafter (see README.md); changed lines carry [dflash2].
+# The one and only config. run.sh reads THIS — there is nothing else to configure.
+# Flag mapping: `name: value` -> --name value | `name: true` -> --name | `name: false` -> omitted.
+
+server:
+  image: qwen38-flash-next-vllm:v5.3-dflash2       # [dflash2] built by run.sh from image/ = myllmbox/qwen38-flash-next-vllm:v5.3
+                                                # + the DFlash2 patches (image/patches, image/files); stock: myllmbox/...:v5.3
+                                                # RecoverSSM, the NVFP4 n-gram table (NVMe, async reads), compressed-scale
+                                                # Marlin MoE, the fused multi-step MTP draft, dynamic draft depth in full CUDA
+                                                # graphs. v5.2 (INT4-AutoRound, vLLM 0.30) = `git checkout v5.2`.
+  docker_args: --security-opt seccomp=unconfined   # required by the image's table reader
+  cpuset: "5-9,15-19"                           # the GB10's 10 Cortex-X925 3.9GHz cores (0-4,10-14
+                                                # are 2.8GHz A725) — measured +2-3% at every concurrency
+  model: nvidia/Qwen3.8-Flash-Next-FP4-Local    # HF repo — downloaded into ./models on first run (~102G). NVIDIA's own
+  model_revision: b9ce18a6887e18c089fdea8509a33e63429a3300   # [dflash2] the revision measured (README)
+  drafter: incoai/Qwen3.8-Flash-Next-DFlash2    # [dflash2] block-diffusion drafter (1.2G), mounted at /dflash2
+  drafter_revision: a22a1744e85c17364dcc54a6a420af7135d4c7f6
+  drafter_sha256: d6723f2a359eaf33ec0c95f22ae8edda896774020c552296a85e1913b4d3186f
+                                                # quantization, served as shipped (NVFP4 experts, MXFP8 dense layers)
+  # model: myllmbox/Qwen3.8-Flash-Next-hibrid48   # our NVFP4 body (98G); set served-model-name below to tell them apart
+  # model: myllmbox/Qwen3.8-Flash-Next-hibrid48-uncensored   # the abliterated body (OrcaRouter) with the same head, 98G:
+                                                # no refusals, NO guardrails — research / red-teaming / private use behind your
+                                                # own moderation. GATED on Hugging Face: accept its agreement, then hf auth login
+                                                # or export HF_TOKEN (run.sh checks). Same speed as hibrid48
+  # model: azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound   # 5 of 512 experts per token, AutoRound int4 (~120G);
+                                                # run.sh applies its settings itself (fp8 table, its draft head, KV 24G)
+  port: 8000
+  models_dir: ./models
+  cache_dir: ./cache                            # compile caches + the table map (~31G, prepared on the first boot); deletable,
+                                                # the next boot rebuilds it
+  patches: ""                                   # vLLM patches from patches/, space-separated; "" = the image as shipped.
+                                                # See patches/README.md
+
+env:
+  DFL2_DRAFT_FP4: "1"                           # [dflash2] drafter linears in NVFP4 (Marlin W4A16); exact (drafts are verified)
+  DFL2_HEAD2: "/opt/dfl2/basis.pt"              # [dflash2] candidates from a 2048-token shortlist (basis fitted on the drafter's
+                                                # own states) instead of the full 1.27G vocabulary head
+  DFL2_TOPK: "32"                               # [dflash2] candidates per draft position (checkpoint: 16)
+  MBX_DRAFT_HEAD2_SCORER: "fp4"                 # [dflash2] the shortlist scorer in NVFP4
+  MBX_GEMM_FILL: "1"                            # [dflash2] GB10 skinny-GEMM plans for every verify width (image patch)
+  MBX_PLE_MMAP: "1"                             # n-gram table off the GPU, read from NVMe
+  MBX_PLE_MMAP_MODE: "nvme"
+  MBX_PLE_MMAP_PREWARM: "0"
+  MBX_PLE_ASYNC: "1"                            # table reads off the critical path: decode stays in full CUDA graphs
+  VLLM_USE_BREAKABLE_CUDAGRAPH: "1"
+  MBX_LOADER_PREPARE: "0"                       # weights exactly as shipped
+  MBX_LOADER_EMPTY_CACHE: "1"
+  MBX_MARLIN_CSF: "1"                           # NVFP4 expert scales stay compressed on the GPU
+  MBX_CSF_VISUAL_BF16: "0"                      # vision tower as shipped
+  MBX_MXFP8_FI_BACKEND: "b12x"                  # MXFP8 layers on FlashInfer's small-M kernels
+  VLLM_DISABLED_KERNELS: FlashInferCutedslMxfp8LinearKernel,FlashInferTrtllmMxfp8LinearKernel,B12xMxfp8LinearKernel,DeepGemmMxfp8BmmLinearKernel,HummingMxfp8LinearKernel
+  MBX_DEPTH_SYNCFREE: "1"                       # draft-depth bookkeeping stays on the GPU
+  MBX_DRAFT_FP8: "1"                            # FP8 drafter projections (exact: every draft is verified)
+  # MBX_DRAFT_HEAD2: two-stage draft head — run.sh picks the basis shipped in the image for the model above
+  # No OMP_NUM_THREADS: vLLM sizes its threads itself (many for the load, one for serving); a fixed value hurts one phase.
+  PYTHONUNBUFFERED: "1"                         # load progress actually shows in ./view.sh
+  VLLM_MARLIN_USE_ATOMIC_ADD: "1"               # Marlin small-N fast path (self-gating)
+  TORCH_CUDA_ARCH_LIST: "12.1a"
+  FLASHINFER_CUDA_ARCH_LIST: "12.1a"
+  TRITON_CACHE_DIR: /cache/triton
+  MALLOC_MMAP_THRESHOLD_: "65536"               # glibc returns big freed blocks to the OS at once (the loader's
+  MALLOC_TRIM_THRESHOLD_: "131072"              # garbage otherwise stays resident — and swaps)
+
+vllm:
+  served-model-name: Qwen/Qwen3.8-Flash-Next
+  engram-config: '{"cpu_offload": false}'
+  moe-backend: marlin                           # NVFP4 experts on Marlin with compressed scales
+  load-format: mbx                              # our loader (reads only what each rank needs; drafter: 3 of 21 files)
+  distributed-executor-backend: mp
+  gpu-memory-utilization: 0.88                  # with kv-cache-memory pinned this does not size the KV pool
+  kv-cache-memory: "27000000000"                # 27G fp8 = 1,661,476 KV tokens; 26G if you run other things on the box
+  kv-cache-dtype: fp8
+  max-model-len: 409600                         # 400k via YaRN = 262,144 × 1.5625 (config: @vr8vr8; 100 % needle
+                                                # retrieval at 407,552 tokens: @grau_marc). Native: 262144 without hf-overrides
+  hf-overrides: '{"text_config":{"max_position_embeddings":409600,"rope_parameters":{"rope_type":"yarn","factor":1.5625,"original_max_position_embeddings":262144,"rope_theta":10000000,"partial_rotary_factor":0.25,"mrope_section":[11,11,10],"mrope_interleaved":true}}}'
+  block-size: 3312                              # the attention ring (12 at K=7) must divide it; vLLM raises it to 6624
+  compilation-config: '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[1,2,3,4,5,6,7,8,10,12,14,15,16,18,20,21,24,28,32,36,40,48,56,64,72,80,88,96,104,112,120,128],"compile_ranges_endpoints":[32]}'
+                                                # full CUDA graphs for decode, 16 seats × (7 drafts + 1) = 128
+  max-num-seqs: 16                              # 16 streams (RecoverSSM: one GDN state per request, no per-draft copies)
+  max-num-batched-tokens: 8192                  # also the image-input encoder budget — keep for image requests
+  enable-prefix-caching: true
+  enable-prompt-tokens-details: true
+  enable-auto-tool-choice: true
+  tool-call-parser: qwen3_xml
+  reasoning-parser: qwen3
+  speculative-config: '{"method":"dflash","model":"/dflash2","num_speculative_tokens":7,"rejection_sample_method":"block","draft_sample_method":"probabilistic","attention_backend":"TRITON_ATTN"}'
+                                                # [dflash2] the drafter drafts its trained block (7 + 1) in one pass; Triton
+                                                # attention so its sliding-window KV takes the 6624-token block (FlashInfer's
+                                                # 64-token blocks reserve ~23G per request in this KV pool)
+                                                # dynamic depth (default): 7 = the deepest a request may draft
+  async-scheduling: true
+  use-replayssm: true                           # RecoverSSM (vLLM PR 58863): drafts verify off one GDN state and replay
+                                                # only the accepted tokens — faster steps, and draft depth costs no memory
+  # default-chat-template-kwargs: '{"enable_thinking": false}'   # thinking off for every request. With thinking ON, give
+                                                # max_tokens well above the reasoning: a small budget ends with empty content
+
+
+# Dynamic draft depth. Each request picks its own draft depth between `min` and num_speculative_tokens from what it has
+# recently accepted; a batch drafts the requests' average depth. run.sh writes cache/mbx-depth.json; the serve re-reads
+# that file while it runs, so the numbers below can be changed live. Fixed K instead: mode: off.
+mtp_depth:
+  mode: dynamic                                 # dynamic (default) | off = fixed K
+  min: 7                                        # [dflash2] verify all 7 drafts (the draft pass costs the same at any depth)
+  window: 48                                    # steps of history each decision looks at (8–128)
+  promote: [101, 101]                           # [dflash2] fixed depth
+  demote: [-1, -1]                              # [dflash2] fixed depth
+  log: false                                    # true = one log line per decision (depth before → after, the measured rate)
+
+
+# Optional front proxy (uncomment the section to use it; absent = vLLM serves the port itself). It keeps long prefills
+# and long thinking alive behind idle-timeout proxies (SSE pings) and can watch the model's text with two guards:
+#   loop guard    — ANY phrase (3–64 chars, with a letter) repeated `loop_repeats` times in a row, or a 2-char run of
+#                   `size` chars ("?!?!?!", "2222…"). Generic: no list needed.
+#   pattern guard — your own strings, one per line in cache/<patterns_file>; a hit when one appears `pattern_count` times.
+# Every hit is logged to cache/logs/; stop: true also ends that answer with <stopped reason="repetition"/> (or reason="pattern") and frees the
+# seat, so the client can retry. log_all: on writes every request + its full response to cache/requests/ (one JSON per
+# request — it holds your users' prompts and answers; off by default).
+# proxy:
+#   keepalive: 30                               # seconds between pings while the model is silent
+#   loop_guard: on                              # on | off
+#   size: 12                                    # 2-char run length; 0 = only phrase loops
+#   loop_period: 64                             # longest repeated phrase checked, in characters
+#   loop_repeats: 8                             # repeats in a row that count as a loop
+#   loop_fields: reasoning_content,reasoning    # where both guards look (add content to watch the answer too)
+#   pattern_guard: off                          # on | off
+#   patterns_file: patterns.txt                 # in cache/, one string per line, # = comment
+#   pattern_count: 1                            # appearances that count as a hit
+#   stop: false                                 # false = log only; true = cut the stream and abort the seat
+#   log_all: off                                # on = every request + response → cache/requests/
+#   token: ""                                   # optional Bearer token for the API

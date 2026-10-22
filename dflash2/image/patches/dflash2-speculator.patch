@@ -1,0 +1,120 @@
+--- a/vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py
+@@ -27,6 +27,10 @@
+     BLOCK_K: tl.constexpr,
+     SAMPLE_PROBABILISTIC: tl.constexpr,
+     USE_FP64: tl.constexpr,
++    APPLY_TOP_P: tl.constexpr = False,
++    top_p_ptr=None,
++    APPLY_TAU: tl.constexpr = False,
++    tau_ptr=None,
+ ):
+     row = tl.program_id(0)
+     offsets = tl.arange(0, BLOCK_K)
+@@ -44,6 +48,28 @@
+             mask=mask & valid,
+             other=float("-inf"),
+         ).to(tl.float64 if USE_FP64 else tl.float32)
++        if APPLY_TAU:
++            # dflash2 kit (DFL2_LIVE_FILE "tau"): draft distribution softmax(scores / (tau * T)); the scaled scores
++            # are also what the rejection sampler gets, so outputs stay exact.
++            scores = scores / tl.load(tau_ptr)
++        if APPLY_TOP_P:
++            # dflash2 kit (DFL2_DRAFT_TOPP): draft truncation. Keep the smallest set of candidates whose mass
++            # under this step's distribution (request temperature) reaches top_p, like the target's own top-p.
++            # The truncated scores are also what the cache kernel hands the rejection sampler, so outputs stay
++            # exact; drafts the target's nucleus would reject are no longer proposed.
++            top_p = tl.load(top_p_ptr)
++            if temperature != 0.0:
++                live = mask & valid & (scores > float("-inf"))
++                z = scores / temperature
++                zmax = tl.max(tl.where(live, z, float("-inf")), axis=0)
++                e = tl.where(live, tl.exp(z - zmax), 0.0)
++                tot = tl.sum(e, axis=0)
++                pr = tl.where(tot > 0, e / tot, 0.0)
++                ps = tl.sort(pr, descending=True)
++                cs = tl.cumsum(ps, axis=0)
++                kept = (cs - ps) < top_p
++                thr = tl.min(tl.where(kept, ps, 2.0), axis=0)
++                scores = tl.where(live & (pr >= thr), scores, float("-inf"))
+         candidate_base = flat * top_k
+         candidates = tl.load(
+             candidate_ptr + candidate_base + offsets,
+@@ -122,6 +148,42 @@
+         self.cached_candidate_ids = torch.zeros(
+             self.scores.shape, dtype=torch.int64, device=device
+         )
++        import os as _os
++
++        # dflash2 kit: draft truncation. DFL2_DRAFT_TOPP = fixed top-p; DFL2_DRAFT_TOPP_FILE = JSON {"top_p": x}
++        # re-read every 0.5 s into the device buffer the captured walk kernel reads (live switching; 1.0 = off).
++        self.top_p_file = _os.environ.get("DFL2_LIVE_FILE", "") or _os.environ.get("DFL2_DRAFT_TOPP_FILE", "")
++        top_p = float(_os.environ.get("DFL2_DRAFT_TOPP", "1.0"))
++        self.apply_top_p = top_p < 1.0 or bool(self.top_p_file)
++        self.top_p_buf = torch.full((1,), top_p, dtype=torch.float32, device=device)
++        self.apply_tau = bool(self.top_p_file)
++        self.tau_buf = torch.ones((1,), dtype=torch.float32, device=device)
++        if self.top_p_file:
++            import json as _json
++            import threading as _threading
++            import time as _time
++
++            def _watch(buf=self.top_p_buf, path=self.top_p_file, dev=device, tau_buf=self.tau_buf):
++                torch.cuda.set_device(dev)
++                side = torch.cuda.Stream(dev)  # own stream: no implicit sync with the serving streams
++                last = None
++                while True:
++                    try:
++                        st = _os.stat(path).st_mtime_ns
++                        if st != last:
++                            last = st
++                            cfg = _json.load(open(path))
++                            v = float(cfg.get("top_p", 1.0))
++                            tau = float(cfg.get("tau", 1.0))
++                            with torch.cuda.stream(side):
++                                buf.fill_(v)
++                                tau_buf.fill_(tau)
++                            side.synchronize()
++                    except Exception:  # noqa: BLE001 (missing or half-written file: keep the last value)
++                        pass
++                    _time.sleep(0.5)
++
++            _threading.Thread(target=_watch, daemon=True, name="dfl2-topp").start()
+ 
+     def sample(
+         self,
+@@ -154,6 +216,10 @@
+             BLOCK_K=block_k,
+             SAMPLE_PROBABILISTIC=draft_logits is not None,
+             USE_FP64=use_fp64,
++            APPLY_TOP_P=self.apply_top_p,
++            top_p_ptr=self.top_p_buf,
++            APPLY_TAU=self.apply_tau,
++            tau_ptr=self.tau_buf,
+             num_warps=1,
+         )
+ 
+@@ -192,11 +258,22 @@
+     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+         super().__init__(vllm_config, device)
+         draft_config = self.draft_model_config.hf_config.dflash_config
+-        self.top_k = int(draft_config[self._candidate_top_k_key])
++        import os as _os
++
++        # dflash2 kit: DFL2_TOPK overrides the selector's candidate count (checkpoint: 16)
++        self.top_k = int(_os.environ.get("DFL2_TOPK") or draft_config[self._candidate_top_k_key])
+         self.candidate_sampler = CandidateSampler(
+             self.max_num_reqs, self.num_speculative_steps, self.top_k, device
+         )
+ 
++    def load_draft_model(self, target_model, target_attn_layer_names):
++        model = super().load_draft_model(target_model, target_attn_layer_names)
++        model.model.candidate_selector.top_k = self.top_k  # dflash2 kit: DFL2_TOPK
++        import dfl2_opt  # dflash2 kit: opt-in draft-side speedups (DFL2_DRAFT_FP8, DFL2_HEAD2)
++
++        dfl2_opt.draft_loaded(model, self.vllm_config)
++        return model
++
+     def draft_logits_spec(self, vllm_config: VllmConfig) -> tuple[torch.dtype, float]:
+         # fp32 so the walk and the rejection that checks it read the same
+         # distribution; -inf because the cache kernel writes only the K

@@ -12,3 +12,10 @@ come from vLLM (Apache-2.0); the three always-on fixes are backports of vLLM pul
 The files run.sh downloads from this repository's releases (draft-head bases and GPTQ codes) are derived from the
 Qwen3.8-Flash-Next-hibrid48 and Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound checkpoints and are distributed under
 their Qwen licenses, which are attached to the same release.
+
+dflash2/run.sh, dflash2/stop.sh, dflash2/view.sh and dflash2/recipe.yaml come from the same repository's tag v5.3
+and remain under their authors' terms; the changes made here (marked [dflash2] in recipe.yaml, [dflash2 kit] in
+run.sh) are offered under Apache-2.0. dflash2/image/patches/ holds diffs against files in the
+myllmbox/qwen38-flash-next-vllm:v5.3 image, several of which come from vLLM (Apache-2.0). The DFlash2 drafter
+(incoai/Qwen3.8-Flash-Next-DFlash2, Apache-2.0) is downloaded by run.sh, not included; dflash2/image/files/
+dfl2_basis_r256.pt holds principal directions of that drafter's hidden states.

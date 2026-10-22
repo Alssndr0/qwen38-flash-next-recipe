@@ -1,0 +1,55 @@
+--- a/vllm/models/qwen4_exp/nvidia/model.py
++++ b/vllm/models/qwen4_exp/nvidia/model.py
+@@ -34,6 +34,7 @@
+     VocabParallelEmbedding,
+ )
+ from vllm.model_executor.models.interfaces import (
++    EagleModelMixin,
+     HasInnerState,
+     IsHybrid,
+     MambaStateShapes,
+@@ -415,7 +416,7 @@
+             moe.experts.update_expert_map()
+ 
+ 
+-class Qwen4ExpModel(nn.Module):
++class Qwen4ExpModel(nn.Module, EagleModelMixin):
+     hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | _EXTRA_WEIGHTS_MAPPER
+ 
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+@@ -556,6 +557,7 @@
+         block_output = None
+         injection = None
+         last_layer = None
++        aux_hidden_states: list[torch.Tensor] = []
+         if self.start_layer < self.end_layer:
+             self._start_layer_ple_prefetch(
+                 self.layers[self.start_layer],
+@@ -608,6 +610,18 @@
+                 block_output = None
+                 injection = None
+                 hidden_states = hidden_states + deepstack_embed
++            if (layer_idx + 1) in self.aux_hidden_state_layers:
++                # DFlash2 capture: the completed output of this layer, averaged over the HC streams. Side output
++                # only: the pending combine stays pending for the next layer's fused combine + norm.
++                assert not self.use_hc_sequence_parallel, "DFlash2 capture: no HC sequence parallelism"
++                completed = (
++                    layer.mlp_hyper_connection.combine(hidden_states, block_output, injection)
++                    if block_output is not None
++                    else hidden_states
++                )
++                aux_hidden_states.append(
++                    completed.unflatten(-1, (self.config.hc_count, self.config.hidden_size)).mean(dim=-2)
++                )
+ 
+         if not get_pp_group().is_last_rank:
+             # PP transports one tensor, not the delayed HC tuple. Materialize
+@@ -649,6 +663,8 @@
+             # this tensor is needed by the final mixer regardless).
+             num_tokens = multi_hidden.shape[0]
+             self._mtp_hidden_buffer[:num_tokens].copy_(multi_hidden)
++        if aux_hidden_states:
++            return sample_hidden_states, aux_hidden_states
+         return sample_hidden_states
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

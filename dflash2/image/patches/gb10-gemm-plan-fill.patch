@@ -1,0 +1,26 @@
+--- a/vllm/models/qwen4_exp/nvidia/low_latency_gemm.py
++++ b/vllm/models/qwen4_exp/nvidia/low_latency_gemm.py
+@@ -291,6 +291,23 @@
+ }
+ 
+ 
++# MBX gemm-fill (opt-in, MBX_GEMM_FILL=1): at one stream the verify width is draft depth + 1 = 2..8, but the GB10 plans
++# cover M = 1, 2, 4, 8, 16 only, so M = 3, 5, 6, 7 (and 9..15) fall back to cuBLAS (SM80 WMMA kernels on GB10). Fill
++# every missing M up to the largest planned one with the next larger plan's parameters compiled for M rows.
++def _mbx_fill_plans(plans):
++    import dataclasses
++    for shape, plan in plans.items():
++        sizes = sorted(plan)
++        for m in range(1, sizes[-1]):
++            if m not in plan:
++                nxt = min(s for s in sizes if s > m)
++                plan[m] = dataclasses.replace(plan[nxt], num_rows=m)
++
++
++if __import__("os").environ.get("MBX_GEMM_FILL", "0") == "1":
++    _mbx_fill_plans(QWEN4_EXP_SM121_GEMM_PLANS)
++
++
+ QWEN4_EXP_GEMM_PLANS_BY_CAPABILITY: dict[
+     tuple[int, int] | None, dict[tuple[int, int], dict[int, SkinnyGemmConfig]]
+ ] = {

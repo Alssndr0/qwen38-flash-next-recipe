@@ -10,6 +10,10 @@ set of decode speedups added on top. Clone it and run it: everything it needs is
 - **Default checkpoint:** [hibrid48](https://huggingface.co/myllmbox/Qwen3.8-Flash-Next-hibrid48). INT4-AutoRound and
   hibrid48-uncensored work too.
 
+**New (2026-10-22): [dflash2/](dflash2/)**, a self-contained kit for NVIDIA's FP4-Local checkpoint on myllmbox's v5.3
+with the [DFlash2](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2) drafter: +6 % decode over the same
+checkpoint with its tuned MTP head, outputs unchanged. `cd dflash2 && ./run.sh`.
+
 The kit itself (run.sh, view.sh, the proxy, the optional patches, the checkpoints and their trade-offs) is documented
 in myllmbox's README, kept here as [docs/UPSTREAM-README.md](docs/UPSTREAM-README.md). This file covers what is
 different. Changes offered back upstream: [#7](https://github.com/myllmbox/qwen38-flash-next-recipe/pull/7),

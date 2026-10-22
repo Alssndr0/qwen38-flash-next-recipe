@@ -1,0 +1,10 @@
+--- a/vllm/model_executor/models/config.py
++++ b/vllm/model_executor/models/config.py
+@@ -952,6 +952,7 @@
+             "mtp",
+             "ngram",
+             "ngram_gpu",
++            "dflash",  # DFlash2: target features from the qwen4exp-dflash2-capture patch
+         }:
+             raise NotImplementedError(
+                 "Qwen4Exp speculative decoding supports only its native MTP "
