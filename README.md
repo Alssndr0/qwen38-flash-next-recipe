@@ -1,5 +1,36 @@
 # Qwen3.8-Flash-Next on one DGX Spark, with faster decoding
 
+Two one-box serving kits for Qwen3.8-Flash-Next on a DGX Spark (GB10), both built on
+[myllmbox/qwen38-flash-next-recipe](https://github.com/myllmbox/qwen38-flash-next-recipe) by
+[@myllmbox](https://github.com/myllmbox) and [@bilikas](https://github.com/bilikas). Clone and run: everything each kit
+needs is in this repo or downloaded by its `run.sh`.
+
+## Reference: FP4-Local + DFlash2, in [dflash2/](dflash2/)
+
+NVIDIA's [Qwen3.8-Flash-Next-FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local) on myllmbox's v5.3
+kit (vLLM 0.32), drafting with [DFlash2](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2), a block-diffusion
+drafter that proposes 7 tokens in one pass, instead of the model's own MTP head. Every drafted token is verified, so
+the outputs are the model's.
+
+- **+6.0 % decode** over the same checkpoint with its tuned MTP head (59.5 vs 56.1 tok/s at 1 stream; 95 % CI +3.3 to
+  +8.7 %), and +16 % over myllmbox's v5.3 as shipped, on 177 recorded OpenCode / Pi agentic requests.
+- **Same quality:** same sampled-output distribution, teacher-forced logits at the serve's own noise floor, 400-problem
+  task eval 351.25 vs 349.5.
+- Speedups for the drafter: NVFP4 weights and a shortlist candidate head (the draft pass goes from ~9 ms to 2.2 ms).
+- Context: the v5.2 kit below serves a different checkpoint (hibrid48, with INT8 target weights) and is faster in
+  absolute terms on the same replay (68.1 tok/s); this kit is the reference for NVIDIA's FP4-Local.
+
+```bash
+git clone https://github.com/Alssndr0/qwen38-flash-next-recipe.git
+cd qwen38-flash-next-recipe
+./tune-host.sh               # once per box (shows what it runs, asks first)
+cd dflash2 && ./run.sh       # builds the image, downloads FP4-Local (~102 GB) and the drafter (1.2 GB), serves :8000
+```
+
+Results, what each patch does and what was tried: [dflash2/README.md](dflash2/README.md).
+
+## The v5.2 kit: hibrid48 (the rest of this page)
+
 This is [myllmbox/qwen38-flash-next-recipe](https://github.com/myllmbox/qwen38-flash-next-recipe) (v5.2), the
 one-box serving kit by [@myllmbox](https://github.com/myllmbox) and [@bilikas](https://github.com/bilikas), with a
 set of decode speedups added on top. Clone it and run it: everything it needs is in this repo or downloaded by
@@ -10,16 +41,12 @@ set of decode speedups added on top. Clone it and run it: everything it needs is
 - **Default checkpoint:** [hibrid48](https://huggingface.co/myllmbox/Qwen3.8-Flash-Next-hibrid48). INT4-AutoRound and
   hibrid48-uncensored work too.
 
-**New (2026-10-22): [dflash2/](dflash2/)**, a self-contained kit for NVIDIA's FP4-Local checkpoint on myllmbox's v5.3
-with the [DFlash2](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2) drafter: +6 % decode over the same
-checkpoint with its tuned MTP head, outputs unchanged. `cd dflash2 && ./run.sh`.
-
 The kit itself (run.sh, view.sh, the proxy, the optional patches, the checkpoints and their trade-offs) is documented
 in myllmbox's README, kept here as [docs/UPSTREAM-README.md](docs/UPSTREAM-README.md). This file covers what is
 different. Changes offered back upstream: [#7](https://github.com/myllmbox/qwen38-flash-next-recipe/pull/7),
 [#8](https://github.com/myllmbox/qwen38-flash-next-recipe/issues/8).
 
-## Run it
+### Run it
 
 On a DGX Spark with Docker and the NVIDIA container runtime:
 
@@ -46,7 +73,7 @@ Everything is set in [recipe.yaml](recipe.yaml). To switch checkpoints, comment 
 another; `run.sh` picks that checkpoint's own files. For a checkpoint without published files (hibrid48-uncensored),
 the draft head and INT8 switch themselves off and the rest still applies.
 
-## What is added
+### What is added
 
 All of it lives in [image/](image/) as a Dockerfile on top of the v5.2 image: diffs against the files already in that
 image ([image/patches/](image/patches/)) and three new files ([image/files/](image/files/)). Each speedup is a line in
@@ -81,7 +108,7 @@ image ([image/patches/](image/patches/)) and three new files ([image/files/](ima
 the per-checkpoint files listed in [opt/assets.tsv](opt/assets.tsv) into `cache/opt/<checkpoint>/`, and `DRY_RUN=1`.
 It also caps INT4-AutoRound's KV pool at 24 GB instead of only replacing an exact 27 GB.
 
-## Measured
+### Measured
 
 One GB10 with the GPU clock capped at 2200 MHz, so an uncapped box is a little faster. Aggregate tok/s over 60 s decode
 windows; single sampled runs vary by about 5 to 10 %. Quality: KL and top-1 agreement of teacher-forced next-token
@@ -127,7 +154,7 @@ draft-head path and the state-dump hook; `v5.2-opt7` adds draft truncation, meas
 - In real use this full INT4 configuration sometimes answered in Chinese. Not investigated, and not seen with hibrid48;
   run a language check before relying on it.
 
-## Making the files for another checkpoint
+### Making the files for another checkpoint
 
 `run.sh` downloads the files for hibrid48 and INT4-AutoRound. For another checkpoint (or to redo them), put them in
 `cache/opt/<checkpoint folder name>/` and `run.sh` uses them.
@@ -154,7 +181,7 @@ draft-head path and the state-dump hook; `v5.2-opt7` adds draft truncation, meas
    `docker run --rm --gpus all -v $PWD/cache:/cache -v $PWD/scripts:/scripts --entrypoint python3 qwen38-flash-next-vllm:v5.2-opt7 /scripts/gptq_int8.py /cache/calib /cache/opt/<checkpoint>/gptq_int8_g128.pt`
 5. Restore `recipe.yaml`; `cache/calib` can be deleted.
 
-## Checking a change
+### Checking a change
 
 - `scripts/klprobe.py capture ref.json` on one serve, `capture new.json` on the other, then
   `scripts/klprobe.py compare ref.json new.json`. The first capture builds the corpus from `KL_SOURCES`
@@ -168,7 +195,8 @@ The scripts talk to `http://127.0.0.1:8000` (`OPT_URL` changes it) and write to 
 ## Credits and license
 
 The kit, its image and the hibrid48 checkpoint are by myllmbox and bilikas; INT4-AutoRound is by
-[@azampatti](https://github.com/azampatti). The always-on fixes are backports from the vLLM pull requests linked above.
+[@azampatti](https://github.com/azampatti); FP4-Local is by NVIDIA; the DFlash2 drafter is by
+[Inco AI](https://huggingface.co/incoai). The always-on fixes are backports from the vLLM pull requests linked above.
 See [NOTICE](NOTICE) for what is licensed how: this repo's additions are Apache-2.0 ([LICENSE](LICENSE)), the files that
 come from myllmbox's repo keep their authors' terms, and the downloaded model-derived files are under the Qwen licenses
 included in the release.
